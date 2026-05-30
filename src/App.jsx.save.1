@@ -37,8 +37,7 @@ async function callClaude(messages, systemPrompt) {
 }
 
 function ResearchAssistant({ prefillNotes, prefillTopic }) {
-  const [topic, setTopic] = useState(prefillTopic || "");
-  const [notes, setNotes] = useState(prefillNotes || "");
+  const [topic, setTopic] = useState(prefillTopic || "")  const [notes, setNotes] = useState(prefillNotes || "");
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [history, setHistory] = useState([]);
@@ -48,25 +47,10 @@ function ResearchAssistant({ prefillNotes, prefillTopic }) {
     setLoading(true);
     setResult(null);
     try {
-      const system = `You are a friendly study assistant. Always use simple plain English, short sentences, and no jargon. If you must use a technical term, explain it immediately in simple words. Format with ## headers, - bullet points, and **bold** key terms.
-
-Your job depends on what the user gives you:
-
-IF the user provides notes or a passage:
-- Focus entirely on what they gave you
-- Do NOT give a general overview of the broader subject
-- Make notes FROM their specific text
-- Explain the terms and ideas that appear in their text
-- Add brief context only where needed
-- Stay focused on their content
-
-IF no notes are provided:
-- Give a clear simple overview of the topic`;
-
+      const system = `You are a friendly study assistant. Explain things simply and clearly like you're talking to a friend. Avoid jargon. If you must use a technical term, explain it right away in simple words. Use short sentences, bullet points, and examples. Format with ## headers and - bullet points and **bold** for key terms.`;
       const userMsg = notes.trim()
-        ? `Topic label: ${topic}\n\nText to make notes from:\n${notes}\n\nPlease make clear simple notes based on this specific text. Explain what it says, clarify any terms in it, and add helpful context where needed.`
+        ? `Topic: ${topic}\n\nMy notes:\n${notes}\n\nPlease help me understand this topic. Use my notes as a starting point, fill in what's missing, and explain everything simply.`
         : `Topic: ${topic}\n\nExplain this topic simply and clearly for studying.`;
-
       const text = await callClaude([{ role: "user", content: userMsg }], system);
       setResult(text);
       setHistory((h) => [{ topic, result: text }, ...h.slice(0, 4)]);
