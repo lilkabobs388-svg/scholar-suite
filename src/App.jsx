@@ -429,11 +429,11 @@ const btnStyle = (disabled) => ({
 export default function App() {
   const [activeTab, setActiveTab] = useState(0);
   const [notesPrefill, setNotesPrefill] = useState("");
-  const [topicPrefill, setTopicPrefall] = useState("");
+  const [topicPrefill, setTopicPrefill] = useState("");
 
-  function handleSendToNotes(translation, originalArabic) {
-    setNotesPrefall("Translated from Arabic text");
-    setNotesPrefall(translation);
+  function handleSendToNotes(translation) {
+    setNotesPrefill(translation);
+    setTopicPrefill("Translated from Arabic");
     setActiveTab(0);
   }
 
@@ -469,7 +469,7 @@ export default function App() {
         </div>
         <div style={{ flex: 1, padding: "1.5rem 2rem", overflow: "hidden" }}>
           <div style={{ height: "calc(100vh - 160px)" }}>
-            {activeTab === 0 && <ResearchAssistant prefillNotes={notesPrefile} prefillTopic={topicPrefall} />}
+            {activeTab === 0 && <ResearchAssistant prefillNotes={notesPrefile} prefillTopic={topicPrefill} />}
             {activeTab === 1 && <StudyPlanner />}
             {activeTab === 2 && <ArabicTranslator onSendToNotes={handleSendToNotes} />}
           </div>
