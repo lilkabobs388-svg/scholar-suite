@@ -20,16 +20,14 @@ const systemFont = "'Crimson Pro', Georgia, serif";
 const monoFont = "'DM Mono', 'Courier New', monospace";
 const sansFont = "'DM Sans', sans-serif";
 
-async function callClaude(messages, systemPrompt, useWebSearch = false) {
+async function callClaude(messages, systemPrompt) {
   const body = {
-    model: "claude-sonnet-4-20250514",
+    model: "llama-3.3-70b-versatile",
     max_tokens: 1000,
     system: systemPrompt,
     messages,
   };
-  if (useWebSearch) {
-    body.tools = [{ type: "web_search_20250305", name: "web_search" }];
-  }
+
   const res = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -42,10 +40,11 @@ async function callClaude(messages, systemPrompt, useWebSearch = false) {
     .join("\n");
 }
 
-function ResearchAssistant() {
-  const [topic, setTopic] = useState("");
-  const [notes, setNotes] = useState("");
-  const [useWeb, setUseWeb] = useState(false);
+// ─── RESEARCH ASSISTANT ───────────────────────────────────────────────────────
+
+function ResearchAssistant({ prefillNotes, prefillTopic }) {
+  const [topic, setTopic] = useState(prefillTopic || "");
+  const [notes, setNotes] = useState(prefillNotes || "");
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [history, setHistory] = useState([]);
@@ -55,19 +54,26 @@ function ResearchAssistant() {
     setLoading(true);
     setResult(null);
     try {
-      const system = `You are a thorough research assistant. When given a topic and optional notes, you:
-1. Provide a structured, comprehensive overview
-2. Fill in gaps in the user's notes with accurate information
-3. Organize everything into clear sections with headers
-4. Highlight key concepts, important facts, and connections
-5. Suggest follow-up questions or areas to explore
-Format your response with clear markdown-style headers using ##, bullet points, and bold key terms.`;
+      const system = `You are a friendly study assistant who explains things simply and clearly. Your job is to help students understand topics easily.
+
+When given a topic and optional notes:
+1. Use plain, everyday English — avoid jargon and technical terms unless necessary
+2. If you must use a technical term, immediately explain it in simple words
+3. Fill in any gaps in the student's notes with easy-to-understand explanations
+4. Organize everything with clear headers and short bullet points
+5. Write like you're explaining to a friend, not writing an academic paper
+6. Keep sentences short and clear
+7. Use examples and analogies to make things click
+
+Format with ## headers, bullet points starting with -, and **bold** for key terms.`;
+
       const userMsg = notes.trim()
-        ? `Topic: ${topic}\n\nMy notes so far:\n${notes}\n\nPlease research this topic, fill gaps in my notes, and give me a comprehensive organized overview.`
-        : `Topic: ${topic}\n\nPlease research this topic and give me a comprehensive organized overview.`;
-      const text = await callClaude([{ role: "user", content: userMsg }], system, useWeb);
+        ? `Topic: ${topic}\n\nMy notes so far:\n${notes}\n\nPlease help me understand this topic better. Use my notes as a starting point, fill in what's missing, and explain everything in simple, easy-to-understand language.`
+        : `Topic: ${topic}\n\nPlease explain this topic to me in simple, easy-to-understand language. Give me a clear overview I can actually use for studying.`;
+
+      const text = await callClaude([{ role: "user", content: userMsg }], system);
       setResult(text);
-      setHistory((h) => [{ topic, result: text, web: useWeb }, ...h.slice(0, 4)]);
+      setHistory((h) => [{ topic, result: text }, ...h.slice(0, 4)]);
     } catch (e) {
       setResult("Error: " + e.message);
     }
@@ -101,12 +107,6 @@ Format your response with clear markdown-style headers using ##, bullet points, 
           <label style={labelStyle}>Your Notes (optional)</label>
           <textarea value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Paste or write any notes you already have..." style={{ ...inputStyle, height: "140px", resize: "vertical" }} />
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
-          <button onClick={() => setUseWeb((v) => !v)} style={{ width: "44px", height: "24px", borderRadius: "12px", border: "none", cursor: "pointer", background: useWeb ? COLORS.accent : COLORS.border, position: "relative", transition: "background 0.2s" }}>
-            <span style={{ position: "absolute", top: "3px", left: useWeb ? "23px" : "3px", width: "18px", height: "18px", borderRadius: "50%", background: "#fff", transition: "left 0.2s" }} />
-          </button>
-          <span style={{ fontFamily: sansFont, fontSize: "0.85rem", color: COLORS.muted }}>{useWeb ? "🌐 Live web search" : "🧠 Claude's knowledge"}</span>
-        </div>
         <button onClick={research} disabled={loading || !topic.trim()} style={btnStyle(loading || !topic.trim())}>
           {loading ? "Researching..." : "Research →"}
         </button>
@@ -116,7 +116,6 @@ Format your response with clear markdown-style headers using ##, bullet points, 
             {history.map((h, i) => (
               <div key={i} onClick={() => { setTopic(h.topic); setResult(h.result); }} style={{ padding: "0.5rem 0.75rem", borderRadius: "6px", background: COLORS.card, marginBottom: "0.4rem", cursor: "pointer", border: `1px solid ${COLORS.border}` }}>
                 <div style={{ fontFamily: sansFont, fontSize: "0.85rem", color: COLORS.text }}>{h.topic}</div>
-                <div style={{ fontFamily: sansFont, fontSize: "0.75rem", color: COLORS.muted }}>{h.web ? "web" : "ai"}</div>
               </div>
             ))}
           </div>
@@ -135,6 +134,8 @@ Format your response with clear markdown-style headers using ##, bullet points, 
     </div>
   );
 }
+
+// ─── STUDY PLANNER ────────────────────────────────────────────────────────────
 
 function StudyPlanner() {
   const [subjects, setSubjects] = useState([]);
@@ -171,7 +172,7 @@ function StudyPlanner() {
     if (breakdown[subject.id]) return;
     setAiLoading(subject.id);
     try {
-      const system = `You are a study planning assistant. Given a subject, generate a clear, practical list of 6-8 key topics a student should study to master it. Return ONLY a JSON array of strings, no other text, no markdown fences. Example: ["Topic 1", "Topic 2"]`;
+      const system = `You are a study planning assistant. Given a subject, generate a clear, practical list of 6-8 key topics a student should study to master it. Keep topic names simple and easy to understand. Return ONLY a JSON array of strings, no other text, no markdown fences. Example: ["Topic 1", "Topic 2"]`;
       const text = await callClaude([{ role: "user", content: `Subject: ${subject.name}` }], system);
       const clean = text.replace(/```json|```/g, "").trim();
       const topics = JSON.parse(clean);
@@ -267,7 +268,9 @@ function StudyPlanner() {
   );
 }
 
-function ArabicTranslator() {
+// ─── ARABIC TRANSLATOR ────────────────────────────────────────────────────────
+
+function ArabicTranslator({ onSendToNotes }) {
   const [input, setInput] = useState("");
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -280,23 +283,27 @@ function ArabicTranslator() {
     const isArToEn = mode === "ar-en";
     try {
       const system = isArToEn
-        ? `You are an expert Arabic-to-English translator with deep knowledge of Modern Standard Arabic, Classical Arabic, Quranic Arabic, and various Arabic dialects. Your translations are:
-- Natural and fluent, avoiding word-for-word literal translation
-- Context-aware, preserving the tone (formal, casual, poetic, religious)
-- Culturally sensitive, explaining idioms or phrases that don't translate directly
-- Rich in nuance, unlike machine translators
+        ? `You are an expert Arabic-to-English translator with deep knowledge of Modern Standard Arabic, Classical Arabic, Quranic Arabic, Islamic scholarship texts, Arabic morphology (sarf), syntax (nahw), and various Arabic dialects.
 
-Format your response as JSON with these fields:
+Your translations follow these rules:
+1. NEVER force-translate proper nouns, technical terms, names of concepts, or specialized terminology — instead keep them transliterated (e.g. "Ẓanna", "Anna wa akhawātuha", "mubtada", "khabar") and explain them in brackets
+2. Read the context carefully — if a word is being used as a technical term in grammar, jurisprudence, theology, or any field, treat it as a term not a regular word
+3. Produce natural, fluent English that captures the meaning and tone — not word-for-word literal translation
+4. For classical or scholarly texts, preserve the register and formality
+5. For casual text, translate naturally and conversationally
+
+Format your response as JSON:
 {
-  "translation": "the natural English translation",
-  "notes": "brief notes on tone, dialect, cultural context, or tricky phrases (2-3 sentences max, omit if straightforward)",
-  "formality": "formal / casual / religious / poetic"
+  "translation": "the natural English translation with transliterated terms kept as-is",
+  "terms": [{"term": "original term", "transliteration": "romanized", "meaning": "simple explanation"}],
+  "notes": "any important context about the text type, style, or tricky parts (keep brief)",
+  "formality": "formal / casual / religious / classical / technical"
 }`
-        : `You are an expert English-to-Arabic translator. Produce natural, fluent Arabic that sounds native. Format your response as JSON:
+        : `You are an expert English-to-Arabic translator. Produce natural, fluent Arabic. Format as JSON:
 {
   "translation": "the Arabic translation",
   "transliteration": "romanized pronunciation guide",
-  "notes": "any notes on register or word choices",
+  "notes": "any notes on word choices",
   "formality": "formal / casual"
 }`;
 
@@ -310,7 +317,7 @@ Format your response as JSON with these fields:
     setLoading(false);
   }
 
-  const formalityColor = { formal: COLORS.blue, casual: COLORS.green, religious: COLORS.accent, poetic: "#d88fd8" };
+  const formalityColor = { formal: COLORS.blue, casual: COLORS.green, religious: COLORS.accent, poetic: "#d88fd8", classical: "#c896d8", technical: COLORS.blue };
 
   return (
     <div style={{ maxWidth: "780px", margin: "0 auto" }}>
@@ -345,6 +352,17 @@ Format your response as JSON with these fields:
             <p style={{ fontFamily: mode === "en-ar" ? "'Noto Naskh Arabic', serif" : systemFont, fontSize: mode === "en-ar" ? "1.3rem" : "1.15rem", color: COLORS.text, lineHeight: 1.8, margin: "0 0 1rem", direction: mode === "en-ar" ? "rtl" : "ltr" }}>
               {result.translation}
             </p>
+            {result.terms && result.terms.length > 0 && (
+              <div style={{ marginBottom: "1rem", padding: "0.75rem 1rem", background: COLORS.surface, borderRadius: "8px", border: `1px solid ${COLORS.blue}33` }}>
+                <div style={{ fontFamily: sansFont, fontSize: "0.78rem", color: COLORS.blue, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: "0.6rem" }}>Key Terms</div>
+                {result.terms.map((t, i) => (
+                  <div key={i} style={{ marginBottom: "0.4rem" }}>
+                    <span style={{ fontFamily: monoFont, fontSize: "0.85rem", color: COLORS.accent }}>{t.transliteration}</span>
+                    <span style={{ fontFamily: sansFont, fontSize: "0.85rem", color: COLORS.muted }}> — {t.meaning}</span>
+                  </div>
+                ))}
+              </div>
+            )}
             {result.transliteration && (
               <p style={{ fontFamily: monoFont, fontSize: "0.9rem", color: COLORS.muted, margin: "0 0 0.75rem", borderTop: `1px solid ${COLORS.border}`, paddingTop: "0.75rem" }}>
                 🔊 {result.transliteration}
@@ -357,7 +375,10 @@ Format your response as JSON with these fields:
               </div>
             )}
           </div>
-          <div style={{ padding: "0.75rem 1.25rem", borderTop: `1px solid ${COLORS.border}`, display: "flex", justifyContent: "flex-end" }}>
+          <div style={{ padding: "0.75rem 1.25rem", borderTop: `1px solid ${COLORS.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <button onClick={() => onSendToNotes(result.translation, input)} style={{ fontFamily: sansFont, fontSize: "0.85rem", color: COLORS.green, background: COLORS.green + "11", border: `1px solid ${COLORS.green}44`, borderRadius: "8px", padding: "0.4rem 0.9rem", cursor: "pointer" }}>
+              📝 Send to Research Notes
+            </button>
             <button onClick={() => navigator.clipboard.writeText(result.translation)} style={{ fontFamily: sansFont, fontSize: "0.8rem", color: COLORS.muted, background: "none", border: "none", cursor: "pointer" }}>
               📋 Copy
             </button>
@@ -367,6 +388,8 @@ Format your response as JSON with these fields:
     </div>
   );
 }
+
+// ─── SHARED ───────────────────────────────────────────────────────────────────
 
 function LoadingDots({ label }) {
   return (
@@ -401,8 +424,18 @@ const btnStyle = (disabled) => ({
   whiteSpace: "nowrap",
 });
 
+// ─── APP ──────────────────────────────────────────────────────────────────────
+
 export default function App() {
   const [activeTab, setActiveTab] = useState(0);
+  const [notesPrefill, setNotesPrefill] = useState("");
+  const [topicPrefill, setTopicPrefall] = useState("");
+
+  function handleSendToNotes(translation, originalArabic) {
+    setNotesPrefall("Translated from Arabic text");
+    setNotesPrefall(translation);
+    setActiveTab(0);
+  }
 
   return (
     <>
@@ -436,9 +469,9 @@ export default function App() {
         </div>
         <div style={{ flex: 1, padding: "1.5rem 2rem", overflow: "hidden" }}>
           <div style={{ height: "calc(100vh - 160px)" }}>
-            {activeTab === 0 && <ResearchAssistant />}
+            {activeTab === 0 && <ResearchAssistant prefillNotes={notesPrefile} prefillTopic={topicPrefall} />}
             {activeTab === 1 && <StudyPlanner />}
-            {activeTab === 2 && <ArabicTranslator />}
+            {activeTab === 2 && <ArabicTranslator onSendToNotes={handleSendToNotes} />}
           </div>
         </div>
       </div>
