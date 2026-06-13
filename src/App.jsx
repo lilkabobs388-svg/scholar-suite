@@ -393,20 +393,26 @@ function ArabicTranslator({ onSendToNotes }) {
       const system = mode === "ar-en"
         ? `You are an expert Arabic-to-English translator specialising in classical Islamic texts. ${bookContext}
 
-Your translation style: word-for-word faithful to the Arabic dictionary. Like a scholar translating a classical text — not a journalist making it sound smooth.
+Translation style: scholarly and literal — like a Dars-e-Nizami student translating line by line. Close to the Arabic, not paraphrased.
 
-Rules:
-1. Translate literally, word by word where possible — preserve the Arabic sentence structure
-2. Use the dictionary (lughat) meaning of each Arabic root — e.g. تنبئ = "informs/indicates/stems from", البيان = "clarity/expression", الظهور = "manifestation/appearance"
-3. Do NOT paraphrase or make it sound conversational — stay close to the Arabic wording even if slightly formal
-4. Keep ALL technical terms in transliteration (e.g. Fasahat, Kalam, Tanafur e Huroof, Mukhalifat al-Qiyas) — never swap them for English equivalents
-5. If a word is a classical/scholarly term, keep it as-is in the translation and list it in terms
-6. Preserve the original sentence structure as much as English grammar allows
+CRITICAL RULES:
+1. Split the Arabic text into its natural phrases or clauses (by commas, "و", "أو", sentence breaks)
+2. Translate each phrase separately — one Arabic phrase paired with one English translation
+3. NEVER translate classical/fiqh/nahw/sarf terms into English — keep them in transliteration:
+   - النكاح → nikāḥ (NOT "marriage contract")
+   - التزويج → tazwīj (NOT "giving in marriage")  
+   - الإيجاب والقبول → al-Ijaab wal-Qabool (NOT "offer and acceptance")
+   - المتعة → al-Mutaa (NOT "pleasure/enjoyment")
+   - الذمي/الذمية → Dhimmi/Dhimmiyya (NOT "non-Muslim")
+   - الفاسق → Faasiq (NOT "sinner")
+   - السنة → Sunnah, الواجب → Waajib, الحرام → Haraam — always keep in transliteration
+4. Use dictionary (lughat) meanings for non-technical words — literal, not interpretive
+5. Preserve Arabic sentence structure where English allows
 
-After translating, write a brief "plain English explanation" — 2-3 sentences, very simple, for a student who is just starting out.
+After the line pairs, write a brief plain English explanation — 2-3 sentences for a beginner.
 
-Respond ONLY with valid JSON in this exact format:
-{"translation":"the literal word-for-word English translation","explanation":"very simple 2-3 sentence explanation of what this passage is basically saying","terms":[{"term":"arabic term","transliteration":"romanized","meaning":"what this means in plain words"}],"notes":"one sentence about what book/field this is from if known, otherwise leave blank","formality":"formal or casual or religious or classical or technical"}`
+Respond ONLY with valid JSON:
+{"lines":[{"arabic":"arabic phrase","english":"literal english translation"}],"explanation":"simple 2-3 sentence explanation","terms":[{"transliteration":"romanized term","meaning":"plain explanation"}],"notes":"one sentence on source/field if known","formality":"classical"}`
         : `You are an expert English-to-Arabic translator. Produce natural fluent Arabic. Respond ONLY with valid JSON: {"translation":"arabic text","transliteration":"romanized guide","notes":"any notes","formality":"formal or casual"}`;
 
       const text = await callClaude([{ role: "user", content: `Translate:\n\n${input}` }], system);
@@ -479,12 +485,30 @@ Respond ONLY with valid JSON in this exact format:
             )}
           </div>
           <div style={{ padding: "1.25rem" }}>
-            {/* Main translation */}
-            <p style={{ fontFamily: mode === "en-ar" ? "'Noto Naskh Arabic', serif" : systemFont, fontSize: mode === "en-ar" ? "1.3rem" : "1.15rem", color: COLORS.text, lineHeight: 1.8, margin: "0 0 1rem", direction: mode === "en-ar" ? "rtl" : "ltr" }}>
-              {result.translation}
-            </p>
+            {/* Line-by-line translation (ar-en) */}
+            {mode === "ar-en" && result.lines && result.lines.length > 0 && (
+              <div style={{ marginBottom: "1.25rem" }}>
+                {result.lines.map((line, i) => (
+                  <div key={i} style={{ borderBottom: i < result.lines.length - 1 ? `1px solid ${COLORS.border}` : "none", paddingBottom: "0.85rem", marginBottom: "0.85rem" }}>
+                    <p style={{ fontFamily: "'Noto Naskh Arabic', serif", fontSize: "1.15rem", color: COLORS.accentLight, direction: "rtl", textAlign: "right", margin: "0 0 0.35rem", lineHeight: 1.8 }}>
+                      {line.arabic}
+                    </p>
+                    <p style={{ fontFamily: systemFont, fontSize: "1rem", color: COLORS.text, margin: 0, lineHeight: 1.7 }}>
+                      {line.english}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
 
-            {/* Plain English explanation — the new simple breakdown */}
+            {/* Fallback single translation (en-ar or if no lines) */}
+            {(mode === "en-ar" || (!result.lines && result.translation)) && (
+              <p style={{ fontFamily: mode === "en-ar" ? "'Noto Naskh Arabic', serif" : systemFont, fontSize: mode === "en-ar" ? "1.3rem" : "1.15rem", color: COLORS.text, lineHeight: 1.8, margin: "0 0 1rem", direction: mode === "en-ar" ? "rtl" : "ltr" }}>
+                {result.translation}
+              </p>
+            )}
+
+            {/* Plain English explanation */}
             {result.explanation && (
               <div style={{ marginBottom: "1rem", padding: "0.85rem 1rem", background: COLORS.green + "10", borderRadius: "8px", borderLeft: `3px solid ${COLORS.green}` }}>
                 <div style={{ fontFamily: sansFont, fontSize: "0.75rem", color: COLORS.green, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: "0.4rem" }}>In Simple Words</div>
@@ -521,13 +545,23 @@ Respond ONLY with valid JSON in this exact format:
           </div>
           <div style={{ padding: "0.75rem 1.25rem", borderTop: `1px solid ${COLORS.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <button
-              onClick={() => onSendToNotes(result.translation, bookName)}
+              onClick={() => {
+                const text = result.lines
+                  ? result.lines.map(l => l.english).join(" ")
+                  : result.translation;
+                onSendToNotes(text, bookName);
+              }}
               style={{ fontFamily: sansFont, fontSize: "0.85rem", color: COLORS.green, background: COLORS.green + "11", border: `1px solid ${COLORS.green}44`, borderRadius: "8px", padding: "0.4rem 0.9rem", cursor: "pointer" }}
             >
               📝 Send to Research Notes
             </button>
             <button
-              onClick={() => navigator.clipboard.writeText(result.translation)}
+              onClick={() => {
+                const text = result.lines
+                  ? result.lines.map(l => `${l.arabic}\n${l.english}`).join("\n\n")
+                  : result.translation;
+                navigator.clipboard.writeText(text);
+              }}
               style={{ fontFamily: sansFont, fontSize: "0.8rem", color: COLORS.muted, background: "none", border: "none", cursor: "pointer" }}
             >
               📋 Copy
