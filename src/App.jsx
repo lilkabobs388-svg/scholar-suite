@@ -54,30 +54,37 @@ function ResearchAssistant({ prefillNotes, prefillTopic, prefillBook }) {
         ? `This content is from the book/source: "${bookName.trim()}". Use your knowledge of this specific work to give accurate context — its field, its scholarly tradition, its authors, and the technical meaning of terms within it.`
         : "";
 
-      const system = `You are a knowledgeable Islamic and classical studies assistant. Use plain, clear English — short sentences, no jargon. When you must use a technical term, immediately explain it simply in brackets.
+      const system = `You are a knowledgeable Islamic and classical studies scholar making study notes. Write in clear English but preserve all Arabic/Urdu technical terms exactly as they are — never replace Fasahat with "eloquence", never replace Tanafur e Huroof with "clashing letters". Keep the terms and explain them after a colon.
 
 ${bookContext}
 
-Format your response using ## headers, - bullet points, and **bold** for key terms.
+Format: ## headers, numbered lists for types/categories, - bullet points for sub-points, **bold** for term names.
 
-IMPORTANT RULES for headers:
-- Never use generic headers like "Introduction to X" or "What is X?"
-- Instead, name headers after the ACTUAL concepts in the content (e.g. "Linguistic Meaning of Amr", "The Hanafi Position", "Definition of Hasan al-Ta'lil")
-- Headers must reflect the specific ideas discussed, not the topic name
+RULES for headers:
+- Name headers after the actual concepts (e.g. "Fasahat of Kalimah", "3 Types of Fasahat", "Linguistic Definition")
+- Never use generic headers like "Introduction to X", "What is X?", "Key Points", "Key Concepts"
+- Mirror the structure of the actual chapter — if it has types, list types; if it has definitions, start with definitions
 
-IF the user provides notes or a passage:
-- Focus entirely on what they gave you — do NOT give a general overview
-- Make notes FROM their specific text
-- Explain the terms and ideas that actually appear in their text
-- Use your knowledge of the book/source to give accurate scholarly context
-- Name your headers after the actual concepts in the text
+RULES for notes style (follow this example):
+## Fasahat — Linguistic Definition
+- In the dictionary: what informs regarding clarity and apparent-ness (al-bayan wal-dhuhur)
+- It is said: "The boy is most eloquent in his speech" — when his words become clear and apparent
+- In terminology: a quality of the Word (Kalimah), Speech (Kalam), and Speaker (Mutakallim)
 
-IF no notes are provided but a book/chapter is given:
-- Use your genuine knowledge of that specific book and chapter
-- Give real scholarly content from that actual source — definitions, positions, key terms, scholarly disagreements
-- Do NOT give generic Islamic or religious advice
-- Do NOT relate it to general Quran/hadith topics unless the book itself does so
-- Treat it as an academic summary of that specific chapter`;
+## 3 Types of Fasahat of Kalimah — it being free from:
+1. **Tanafur e Huroof**: letters in a word that make it hard on the tongue e.g. الظَّشْن
+2. **Mukhalifat al-Qiyas**: words not following the rules of Sarf e.g. بُوقات instead of أبواق
+3. **Gharabah** (strangeness): a word used other than its apparent meaning e.g. تَكَأْكَأ instead of اجتمع
+
+IF the user provides notes/a passage:
+- Extract and structure the actual content — don't summarise loosely
+- Keep all technical terms as-is
+- Use numbered lists for types/categories exactly as they appear in the text
+
+IF no notes provided but book/chapter given:
+- Use your real knowledge of that specific chapter
+- Give the actual definitions, types, conditions and examples from that source
+- Do NOT give generic Islamic advice or relate it to Quran/hadith unless the chapter does so`;
 
       const userMsg = notes.trim()
         ? `Topic: ${topic}${bookName.trim() ? `\nSource: ${bookName.trim()}` : ""}\n\nText to make notes from:\n${notes}\n\nMake clear, focused notes based on this specific text.`
@@ -386,18 +393,20 @@ function ArabicTranslator({ onSendToNotes }) {
       const system = mode === "ar-en"
         ? `You are an expert Arabic-to-English translator specialising in classical Islamic texts. ${bookContext}
 
-Rules:
-1. Never force-translate proper nouns, technical terms, or specialized concepts — keep them transliterated and explain them in brackets
-2. Read context carefully — if a word is a technical term in grammar, jurisprudence, theology, etc, treat it as a term not a regular word
-3. Translate as close to literal as possible while still being readable
-4. Follow the Arabic dictionary meaning of each word — do not interpret freely
-5. If a word has multiple dictionary meanings, pick the one that fits the classical/scholarly context
-6. For classical or scholarly texts, stay faithful to the Arabic structure where possible
+Your translation style: word-for-word faithful to the Arabic dictionary. Like a scholar translating a classical text — not a journalist making it sound smooth.
 
-After translating, write a short "plain English explanation" — 2-4 sentences that explain what this passage is basically saying, as if explaining to a student who just started studying. Use simple everyday words.
+Rules:
+1. Translate literally, word by word where possible — preserve the Arabic sentence structure
+2. Use the dictionary (lughat) meaning of each Arabic root — e.g. تنبئ = "informs/indicates/stems from", البيان = "clarity/expression", الظهور = "manifestation/appearance"
+3. Do NOT paraphrase or make it sound conversational — stay close to the Arabic wording even if slightly formal
+4. Keep ALL technical terms in transliteration (e.g. Fasahat, Kalam, Tanafur e Huroof, Mukhalifat al-Qiyas) — never swap them for English equivalents
+5. If a word is a classical/scholarly term, keep it as-is in the translation and list it in terms
+6. Preserve the original sentence structure as much as English grammar allows
+
+After translating, write a brief "plain English explanation" — 2-3 sentences, very simple, for a student who is just starting out.
 
 Respond ONLY with valid JSON in this exact format:
-{"translation":"the English translation","explanation":"plain English explanation of what this is saying, simply put","terms":[{"term":"arabic term","transliteration":"romanized","meaning":"simple explanation in plain words"}],"notes":"one sentence saying what book/subject this is from if known, otherwise leave blank","formality":"formal or casual or religious or classical or technical"}`
+{"translation":"the literal word-for-word English translation","explanation":"very simple 2-3 sentence explanation of what this passage is basically saying","terms":[{"term":"arabic term","transliteration":"romanized","meaning":"what this means in plain words"}],"notes":"one sentence about what book/field this is from if known, otherwise leave blank","formality":"formal or casual or religious or classical or technical"}`
         : `You are an expert English-to-Arabic translator. Produce natural fluent Arabic. Respond ONLY with valid JSON: {"translation":"arabic text","transliteration":"romanized guide","notes":"any notes","formality":"formal or casual"}`;
 
       const text = await callClaude([{ role: "user", content: `Translate:\n\n${input}` }], system);
