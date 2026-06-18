@@ -1,4 +1,7 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
+import * as pdfjsLib from "pdfjs-dist";
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
 
 const TABS = ["Research", "Study Planner", "Translator"];
 
@@ -20,10 +23,15 @@ const systemFont = "'Crimson Pro', Georgia, serif";
 const monoFont = "'DM Mono', 'Courier New', monospace";
 const sansFont = "'DM Sans', sans-serif";
 
-async function callClaude(messages, systemPrompt) {
+const LIBRARY_KEY = "scholarSuiteLibrary";
+// Groq's free tier caps around 6,000-12,000 tokens/minute (input+output combined) for this
+// model — far less than its 128k context window. We keep excerpts small and surface 429s clearly.
+const EXCERPT_WINDOW_CHARS = 4000;
+
+async function callClaude(messages, systemPrompt, maxTokens = 1200) {
   const body = {
     model: "llama-3.3-70b-versatile",
-    max_tokens: 1000,
+    max_tokens: maxTokens,
     system: systemPrompt,
     messages,
   };
@@ -33,7 +41,174 @@ async function callClaude(messages, systemPrompt) {
     body: JSON.stringify(body),
   });
   const data = await res.json();
+  if (data.error) {
+    const msg = /rate|429|limit/i.test(data.error)
+      ? "Rate limit reached on the free Groq tier — wait about a minute and try again."
+      : data.error;
+    throw new Error(msg);
+  }
   return data.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+}
+
+// Shared book library — persisted in localStorage, used by Research and Translator
+function useBookLibrary() {
+  const [library, setLibrary] = useState([]);
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(LIBRARY_KEY);
+      if (saved) setLibrary(JSON.parse(saved));
+    } catch (e) {
+      console.error("Failed to load library", e);
+    }
+  }, []);
+
+  function persist(next) {
+    setLibrary(next);
+    try {
+      localStorage.setItem(LIBRARY_KEY, JSON.stringify(next));
+    } catch (e) {
+      console.error("Failed to save library — storage may be full", e);
+    }
+  }
+
+  function addBook(name, text) {
+    const book = { id: Date.now().toString(), name, text, chars: text.length, dateAdded: new Date().toISOString() };
+    persist([...library, book]);
+    return book;
+  }
+
+  function removeBook(id) {
+    persist(library.filter((b) => b.id !== id));
+  }
+
+  return { library, addBook, removeBook };
+}
+
+async function extractPdfText(file, onProgress) {
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  let fullText = "";
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    const pageText = content.items.map((item) => item.str).join(" ");
+    fullText += pageText + "\n\n";
+    if (onProgress) onProgress(i, pdf.numPages);
+  }
+  return fullText.trim();
+}
+
+// Simple keyword-based search to find the most relevant chunk of a book for a given
+// topic, so we only send a small, targeted excerpt to the AI instead of the whole text.
+function findRelevantExcerpt(fullText, topic, windowChars = EXCERPT_WINDOW_CHARS) {
+  const keywords = topic
+    .toLowerCase()
+    .replace(/[^\p{L}\s]/gu, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 2);
+
+  if (keywords.length === 0 || !fullText) return null;
+
+  const scanChunk = 1500;
+  const step = 750;
+  let bestScore = 0;
+  let bestStart = -1;
+
+  for (let start = 0; start < fullText.length; start += step) {
+    const chunk = fullText.slice(start, start + scanChunk).toLowerCase();
+    let score = 0;
+    for (const kw of keywords) {
+      score += chunk.split(kw).length - 1;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestStart = start;
+    }
+  }
+
+  if (bestStart === -1) return null; // no real match anywhere in the book
+
+  const excerptStart = Math.max(0, bestStart - 500);
+  const excerptEnd = Math.min(fullText.length, excerptStart + windowChars);
+  return fullText.slice(excerptStart, excerptEnd);
+}
+
+function BookLibraryPanel({ library, addBook, removeBook, selectedBookId, onSelectBook }) {
+  const [uploading, setUploading] = useState(false);
+  const [progress, setProgress] = useState(null);
+  const fileInputRef = useRef(null);
+
+  async function handleFileChange(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploading(true);
+    setProgress({ current: 0, total: 0 });
+    try {
+      const text = await extractPdfText(file, (current, total) => setProgress({ current, total }));
+      const name = file.name.replace(/\.pdf$/i, "");
+      const book = addBook(name, text);
+      onSelectBook(book.id);
+    } catch (err) {
+      alert("Couldn't read this PDF: " + err.message);
+    }
+    setUploading(false);
+    setProgress(null);
+    e.target.value = "";
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.5rem" }}>
+        <label style={{ ...labelStyle, marginBottom: 0 }}>📚 My Books</label>
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          disabled={uploading}
+          style={{ background: "none", border: `1px solid ${COLORS.accent}55`, color: COLORS.accent, borderRadius: "6px", padding: "0.25rem 0.6rem", fontSize: "0.75rem", fontFamily: sansFont, cursor: uploading ? "not-allowed" : "pointer" }}
+        >
+          {uploading ? "Reading..." : "+ Add PDF"}
+        </button>
+        <input ref={fileInputRef} type="file" accept=".pdf" onChange={handleFileChange} style={{ display: "none" }} />
+      </div>
+
+      {uploading && progress && (
+        <div style={{ fontFamily: sansFont, fontSize: "0.78rem", color: COLORS.muted, marginBottom: "0.5rem" }}>
+          {progress.total ? `Reading page ${progress.current}/${progress.total}...` : "Opening PDF..."}
+        </div>
+      )}
+
+      {library.length === 0 && !uploading && (
+        <div style={{ fontFamily: sansFont, fontSize: "0.78rem", color: COLORS.muted, marginBottom: "0.5rem" }}>
+          No books yet — upload a PDF once and it stays saved.
+        </div>
+      )}
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "0.4rem" }}>
+        {library.map((b) => (
+          <div
+            key={b.id}
+            onClick={() => onSelectBook(b.id === selectedBookId ? null : b.id)}
+            style={{
+              display: "flex", alignItems: "center", gap: "0.4rem",
+              padding: "0.3rem 0.6rem", borderRadius: "14px", cursor: "pointer",
+              background: selectedBookId === b.id ? COLORS.accent + "22" : COLORS.surface,
+              border: `1px solid ${selectedBookId === b.id ? COLORS.accent : COLORS.border}`,
+            }}
+          >
+            <span style={{ fontFamily: sansFont, fontSize: "0.78rem", color: selectedBookId === b.id ? COLORS.accent : COLORS.text }}>
+              {b.name}
+            </span>
+            <span
+              onClick={(e) => { e.stopPropagation(); if (confirm(`Remove "${b.name}" from your library?`)) removeBook(b.id); }}
+              style={{ color: COLORS.red, fontSize: "0.7rem", cursor: "pointer" }}
+            >
+              ✕
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function ResearchAssistant({ prefillNotes, prefillTopic, prefillBook }) {
@@ -43,16 +218,41 @@ function ResearchAssistant({ prefillNotes, prefillTopic, prefillBook }) {
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [history, setHistory] = useState([]);
+  const { library, addBook, removeBook } = useBookLibrary();
+  const [selectedBookId, setSelectedBookId] = useState(null);
+
+  const selectedBook = library.find((b) => b.id === selectedBookId) || null;
+
+  function handleSelectBook(id) {
+    setSelectedBookId(id);
+    const book = library.find((b) => b.id === id);
+    setBookName(book ? book.name : "");
+  }
 
   async function research() {
     if (!topic.trim()) return;
     setLoading(true);
     setResult(null);
     try {
-      // Build book context string
-      const bookContext = bookName.trim()
-        ? `This content is from the book/source: "${bookName.trim()}". Use your knowledge of this specific work to give accurate context — its field, its scholarly tradition, its authors, and the technical meaning of terms within it.`
-        : "";
+      // Build book context. If the user already pasted notes, we don't also need to
+      // dump book text — that just burns tokens for no reason. The PDF excerpt only
+      // matters when there's no pasted text and we need something to ground the AI.
+      let bookContext = "";
+      let bookTextBlock = "";
+      let excerptNotFound = false;
+
+      if (!notes.trim() && selectedBook) {
+        const excerpt = findRelevantExcerpt(selectedBook.text, topic);
+        if (excerpt) {
+          bookContext = `Below is an EXCERPT found by searching the actual book "${selectedBook.name}" for content matching the topic. It may not be the full chapter and may include text just before or after the most relevant part — use your judgement to focus on what's actually relevant. Base your notes on this real text, not general outside knowledge.`;
+          bookTextBlock = `\n\n--- EXCERPT FROM "${selectedBook.name}" ---\n${excerpt}\n--- END EXCERPT ---`;
+        } else {
+          excerptNotFound = true;
+          bookContext = `The user has the book "${selectedBook.name}" but a text search for this topic inside it found no clear match — it may be phrased differently in the book, or this topic may be in a different part. Use your own knowledge of this book and topic instead, and don't pretend to quote the book directly.`;
+        }
+      } else if (bookName.trim()) {
+        bookContext = `This content is from the book/source: "${bookName.trim()}". Use your knowledge of this specific work to give accurate context — its field, its scholarly tradition, its authors, and the technical meaning of terms within it.`;
+      }
 
       const system = `You are a knowledgeable Islamic and classical studies scholar making study notes. Write in clear English but preserve all Arabic/Urdu technical terms exactly as they are — never replace Fasahat with "eloquence", never replace Tanafur e Huroof with "clashing letters". Keep the terms and explain them after a colon.
 
@@ -88,10 +288,10 @@ IF no notes provided but book/chapter given:
 
       const userMsg = notes.trim()
         ? `Topic: ${topic}${bookName.trim() ? `\nSource: ${bookName.trim()}` : ""}\n\nText to make notes from:\n${notes}\n\nMake clear, focused notes based on this specific text.`
-        : `Topic: ${topic}${bookName.trim() ? `\nBook/Source: ${bookName.trim()}` : ""}\n\nGive me real, accurate notes on this specific topic from this specific source. Use your knowledge of this book.`;
+        : `Topic: ${topic}${bookName.trim() ? `\nBook/Source: ${bookName.trim()}` : ""}\n\nGive me real, accurate notes on this specific topic from this specific source.${bookTextBlock}`;
 
-      const text = await callClaude([{ role: "user", content: userMsg }], system);
-      setResult(text);
+      const text = await callClaude([{ role: "user", content: userMsg }], system, 1500);
+      setResult(excerptNotFound ? `⚠️ No exact match found in your PDF for this topic — using general knowledge instead.\n\n${text}` : text);
       setHistory((h) => [{ topic, bookName, result: text }, ...h.slice(0, 4)]);
     } catch (e) {
       setResult("Error: " + e.message);
@@ -152,13 +352,27 @@ IF no notes provided but book/chapter given:
           />
         </div>
         <div>
+          <BookLibraryPanel
+            library={library}
+            addBook={addBook}
+            removeBook={removeBook}
+            selectedBookId={selectedBookId}
+            onSelectBook={handleSelectBook}
+          />
+        </div>
+        <div>
           <label style={labelStyle}>Book / Source (optional)</label>
           <input
             value={bookName}
-            onChange={(e) => setBookName(e.target.value)}
-            placeholder="e.g. Usool e Shashi, Hidaya, Ihya..."
+            onChange={(e) => { setBookName(e.target.value); setSelectedBookId(null); }}
+            placeholder="Type a name, or select a book above"
             style={inputStyle}
           />
+          {selectedBook && (
+            <div style={{ fontFamily: sansFont, fontSize: "0.75rem", color: COLORS.green, marginTop: "0.3rem" }}>
+              ✓ Reading from your uploaded PDF ({selectedBook.chars.toLocaleString()} chars)
+            </div>
+          )}
         </div>
         <div>
           <label style={labelStyle}>Your Notes (optional)</label>
@@ -247,7 +461,7 @@ function StudyPlanner() {
     setAiLoading(subject.id);
     try {
       const system = `You are a study planning assistant. Given a subject, generate 6-8 key topics a student should study. Keep names simple. Return ONLY a JSON array of strings, no markdown. Example: ["Topic 1", "Topic 2"]`;
-      const text = await callClaude([{ role: "user", content: `Subject: ${subject.name}` }], system);
+      const text = await callClaude([{ role: "user", content: `Subject: ${subject.name}` }], system, 400);
       const clean = text.replace(/```json|```/g, "").trim();
       const topics = JSON.parse(clean);
       setBreakdown((prev) => ({ ...prev, [subject.id]: topics }));
@@ -387,54 +601,64 @@ function ArabicTranslator({ onSendToNotes }) {
     setResult(null);
     try {
       const bookContext = bookName.trim()
-        ? `This text is from: "${bookName.trim()}". Use your knowledge of this source to translate accurately and give a helpful, specific note about what field/topic this is from.`
+        ? `This text is from: "${bookName.trim()}". Use your knowledge of this source to inform the translation, subject detection, and source notes.`
         : "";
 
       const system = mode === "ar-en"
-        ? `You are an expert Arabic-to-English translator specialising in classical Islamic texts. ${bookContext}
+        ? `You are an expert translator of Classical Arabic texts and a study assistant for students of traditional Islamic sciences.
 
-Translation style: scholarly and literal — like a Dars-e-Nizami student translating line by line. Close to the Arabic, not paraphrased.
+Your task is to help students understand texts from any subject, including but not limited to: Fiqh, Usul al-Fiqh, Nahw, Sarf, Balaghah, Aqidah, Tafsir, Hadith, Mantiq, Tajwid, Arabic Literature, Classical Poetry, Seerah, Islamic History, Uloom al-Quran, Uloom al-Hadith.
 
-CRITICAL RULES:
-1. Split the Arabic text into its natural phrases or clauses (by commas, "و", "أو", sentence breaks)
-2. Translate each phrase separately — one Arabic phrase paired with one English translation
-3. NEVER translate classical/fiqh/nahw/sarf terms into English — keep them in transliteration:
-   - النكاح → nikāḥ (NOT "marriage contract")
-   - التزويج → tazwīj (NOT "giving in marriage")  
-   - الإيجاب والقبول → al-Ijaab wal-Qabool (NOT "offer and acceptance")
-   - المتعة → al-Mutaa (NOT "pleasure/enjoyment")
-   - الذمي/الذمية → Dhimmi/Dhimmiyya (NOT "non-Muslim")
-   - الفاسق → Faasiq (NOT "sinner")
-   - السنة → Sunnah, الواجب → Waajib, الحرام → Haraam — always keep in transliteration
-4. Use dictionary (lughat) meanings for non-technical words — literal, not interpretive
-5. Preserve Arabic sentence structure where English allows
+${bookContext}
 
-After the line pairs, write a brief plain English explanation — 2-3 sentences for a beginner.
+GENERAL RULES:
+1. Determine the likely subject of the text automatically.
+2. Translate according to the conventions of that subject.
+3. Stay close to the Arabic wording — do NOT excessively paraphrase.
+4. Do NOT produce awkward machine-like English.
+5. Do NOT turn the translation into a commentary.
+6. Preserve important Arabic and technical terms in transliteration with a concise English meaning in parentheses immediately after. Examples: al-Mutah (enjoyment), an-Nikah (marriage), al-Ijab (offer), al-Qabul (acceptance), al-Fasiq (open sinner), adh-Dhimmi (protected non-Muslim).
+7. Prefer the intended scholarly meaning over an incorrect dictionary meaning.
+8. Assume the reader is a student studying a traditional text.
 
-Respond ONLY with valid JSON:
-{"lines":[{"arabic":"arabic phrase","english":"literal english translation"}],"explanation":"simple 2-3 sentence explanation","terms":[{"transliteration":"romanized term","meaning":"plain explanation"}],"notes":"one sentence on source/field if known","formality":"classical"}`
+Respond ONLY with valid JSON in this exact format — no extra text, no markdown fences:
+{
+  "wordByWord": [{"arabic": "vowelled arabic word or phrase", "english": "meaning"}],
+  "translation": "the full running translation as a single string",
+  "explanation": "2-4 sentence beginner-friendly explanation in simple language",
+  "terms": [{"arabic": "arabic term", "transliteration": "romanized", "meaning": "concise meaning"}],
+  "irab": [{"word": "arabic word", "role": "grammatical role", "state": "grammatical state", "explanation": "short explanation"}],
+  "studyTip": "one sentence on the main point a student should remember",
+  "source": "Field: detected subject e.g. Hanafi Fiqh, Nahw, Balaghah",
+  "formality": "classical"
+}`
         : `You are an expert English-to-Arabic translator. Produce natural fluent Arabic. Respond ONLY with valid JSON: {"translation":"arabic text","transliteration":"romanized guide","notes":"any notes","formality":"formal or casual"}`;
 
-      const text = await callClaude([{ role: "user", content: `Translate:\n\n${input}` }], system);
+      const text = await callClaude([{ role: "user", content: `Translate:\n\n${input}` }], system, 1600);
       const clean = text.replace(/```json|```/g, "").trim();
       const parsed = JSON.parse(clean);
       setResult(parsed);
     } catch (e) {
-      setResult({ translation: "Translation error. Please try again.", notes: e.message, formality: "—" });
+      setResult({ translation: "Translation error. Please try again.", source: e.message, formality: "—" });
     }
     setLoading(false);
   }
 
-  const formalityColor = {
-    formal: COLORS.blue,
-    casual: COLORS.green,
-    religious: COLORS.accent,
-    classical: "#c896d8",
-    technical: COLORS.blue,
-  };
+  const SectionLabel = ({ children, color }) => (
+    <div style={{ fontFamily: sansFont, fontSize: "0.72rem", color: color || COLORS.muted, textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: "0.6rem", fontWeight: 600 }}>
+      {children}
+    </div>
+  );
+
+  const Card = ({ children, borderColor, bg }) => (
+    <div style={{ marginBottom: "1rem", padding: "0.85rem 1rem", background: bg || COLORS.surface, borderRadius: "8px", border: `1px solid ${borderColor || COLORS.border}` }}>
+      {children}
+    </div>
+  );
 
   return (
     <div style={{ maxWidth: "780px", margin: "0 auto" }}>
+      {/* Mode toggle */}
       <div style={{ display: "flex", gap: "0.75rem", marginBottom: "1.25rem", justifyContent: "center" }}>
         {[["ar-en", "العربية → English"], ["en-ar", "English → العربية"]].map(([v, label]) => (
           <button
@@ -447,16 +671,17 @@ Respond ONLY with valid JSON:
         ))}
       </div>
 
-      {/* Book name field */}
+      {/* Book name */}
       <div style={{ marginBottom: "0.75rem" }}>
         <input
           value={bookName}
           onChange={(e) => setBookName(e.target.value)}
-          placeholder="Book name (optional) — e.g. Usool e Shashi, Ihya, Hidaya..."
+          placeholder="Book name (optional) — e.g. Hidaya, Duroos al-Balaghah, Usool e Shashi..."
           style={{ ...inputStyle, fontSize: "0.875rem" }}
         />
       </div>
 
+      {/* Input area */}
       <div style={{ background: COLORS.card, borderRadius: "12px", border: `1px solid ${COLORS.border}`, overflow: "hidden" }}>
         <textarea
           value={input}
@@ -475,98 +700,116 @@ Respond ONLY with valid JSON:
       {loading && <div style={{ marginTop: "1.5rem" }}><LoadingDots label="Translating" /></div>}
 
       {result && !loading && (
-        <div style={{ marginTop: "1.5rem", background: COLORS.card, borderRadius: "12px", border: `1px solid ${COLORS.border}`, overflow: "hidden" }}>
-          <div style={{ padding: "0.75rem 1.25rem", background: COLORS.surface, borderBottom: `1px solid ${COLORS.border}`, display: "flex", gap: "0.75rem", alignItems: "center" }}>
-            <span style={{ fontFamily: sansFont, fontSize: "0.78rem", color: COLORS.muted, textTransform: "uppercase", letterSpacing: "0.05em" }}>Translation</span>
-            {result.formality && (
-              <span style={{ padding: "0.2rem 0.6rem", borderRadius: "12px", background: (formalityColor[result.formality] || COLORS.muted) + "22", color: formalityColor[result.formality] || COLORS.muted, fontFamily: sansFont, fontSize: "0.75rem" }}>
-                {result.formality}
-              </span>
-            )}
-          </div>
-          <div style={{ padding: "1.25rem" }}>
-            {/* Line-by-line translation (ar-en) */}
-            {mode === "ar-en" && result.lines && result.lines.length > 0 && (
-              <div style={{ marginBottom: "1.25rem" }}>
-                {result.lines.map((line, i) => (
-                  <div key={i} style={{ borderBottom: i < result.lines.length - 1 ? `1px solid ${COLORS.border}` : "none", paddingBottom: "0.85rem", marginBottom: "0.85rem" }}>
-                    <p style={{ fontFamily: "'Noto Naskh Arabic', serif", fontSize: "1.15rem", color: COLORS.accentLight, direction: "rtl", textAlign: "right", margin: "0 0 0.35rem", lineHeight: 1.8 }}>
-                      {line.arabic}
-                    </p>
-                    <p style={{ fontFamily: systemFont, fontSize: "1rem", color: COLORS.text, margin: 0, lineHeight: 1.7 }}>
-                      {line.english}
-                    </p>
+        <div style={{ marginTop: "1.5rem", display: "flex", flexDirection: "column", gap: "0" }}>
+
+          {/* ── WORD BY WORD ── */}
+          {mode === "ar-en" && result.wordByWord && result.wordByWord.length > 0 && (
+            <div style={{ background: COLORS.card, borderRadius: "12px 12px 0 0", border: `1px solid ${COLORS.border}`, borderBottom: "none", padding: "1.1rem 1.25rem" }}>
+              <SectionLabel color={COLORS.accent}>Word by Word</SectionLabel>
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                {result.wordByWord.map((w, i) => (
+                  <div key={i} style={{ display: "flex", alignItems: "baseline", gap: "0.75rem" }}>
+                    <span style={{ fontFamily: "'Noto Naskh Arabic', serif", fontSize: "1.1rem", color: COLORS.accentLight, direction: "rtl", minWidth: "120px", textAlign: "right" }}>{w.arabic}</span>
+                    <span style={{ color: COLORS.muted, fontSize: "0.85rem" }}>—</span>
+                    <span style={{ fontFamily: sansFont, fontSize: "0.88rem", color: COLORS.text }}>{w.english}</span>
                   </div>
                 ))}
               </div>
-            )}
+            </div>
+          )}
 
-            {/* Fallback single translation (en-ar or if no lines) */}
-            {(mode === "en-ar" || (!result.lines && result.translation)) && (
-              <p style={{ fontFamily: mode === "en-ar" ? "'Noto Naskh Arabic', serif" : systemFont, fontSize: mode === "en-ar" ? "1.3rem" : "1.15rem", color: COLORS.text, lineHeight: 1.8, margin: "0 0 1rem", direction: mode === "en-ar" ? "rtl" : "ltr" }}>
+          {/* ── MAIN TRANSLATION ── */}
+          <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderTop: result.wordByWord ? `1px solid ${COLORS.border}` : undefined, borderRadius: result.wordByWord ? "0" : "12px 12px 0 0", padding: "1.1rem 1.25rem", borderBottom: "none" }}>
+            <SectionLabel color={COLORS.blue}>Translation</SectionLabel>
+            {mode === "ar-en" ? (
+              <p style={{ fontFamily: systemFont, fontSize: "1.1rem", color: COLORS.text, lineHeight: 1.85, margin: 0 }}>
+                {result.translation}
+              </p>
+            ) : (
+              <p style={{ fontFamily: "'Noto Naskh Arabic', serif", fontSize: "1.3rem", color: COLORS.text, lineHeight: 1.85, margin: 0, direction: "rtl" }}>
                 {result.translation}
               </p>
             )}
+          </div>
 
-            {/* Plain English explanation */}
-            {result.explanation && (
-              <div style={{ marginBottom: "1rem", padding: "0.85rem 1rem", background: COLORS.green + "10", borderRadius: "8px", borderLeft: `3px solid ${COLORS.green}` }}>
-                <div style={{ fontFamily: sansFont, fontSize: "0.75rem", color: COLORS.green, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: "0.4rem" }}>In Simple Words</div>
-                <p style={{ fontFamily: sansFont, fontSize: "0.875rem", color: COLORS.text, margin: 0, lineHeight: 1.65 }}>{result.explanation}</p>
-              </div>
-            )}
+          {/* ── SIMPLE EXPLANATION ── */}
+          {result.explanation && (
+            <div style={{ background: COLORS.green + "0f", border: `1px solid ${COLORS.border}`, borderTop: `1px solid ${COLORS.green}22`, padding: "1rem 1.25rem", borderBottom: "none" }}>
+              <SectionLabel color={COLORS.green}>Simple Explanation</SectionLabel>
+              <p style={{ fontFamily: sansFont, fontSize: "0.88rem", color: COLORS.text, margin: 0, lineHeight: 1.7 }}>{result.explanation}</p>
+            </div>
+          )}
 
-            {/* Key terms */}
-            {result.terms && result.terms.length > 0 && (
-              <div style={{ marginBottom: "1rem", padding: "0.75rem 1rem", background: COLORS.surface, borderRadius: "8px", border: `1px solid ${COLORS.blue}33` }}>
-                <div style={{ fontFamily: sansFont, fontSize: "0.78rem", color: COLORS.blue, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: "0.6rem" }}>Key Terms</div>
+          {/* ── KEY TERMS ── */}
+          {result.terms && result.terms.length > 0 && (
+            <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderTop: `1px solid ${COLORS.blue}22`, padding: "1rem 1.25rem", borderBottom: "none" }}>
+              <SectionLabel color={COLORS.blue}>Key Terms</SectionLabel>
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem" }}>
                 {result.terms.map((t, i) => (
-                  <div key={i} style={{ marginBottom: "0.4rem" }}>
-                    <span style={{ fontFamily: monoFont, fontSize: "0.85rem", color: COLORS.accent }}>{t.transliteration}</span>
-                    <span style={{ fontFamily: sansFont, fontSize: "0.85rem", color: COLORS.muted }}> — {t.meaning}</span>
+                  <div key={i} style={{ display: "flex", gap: "0.5rem", alignItems: "baseline", flexWrap: "wrap" }}>
+                    {t.arabic && <span style={{ fontFamily: "'Noto Naskh Arabic', serif", fontSize: "1rem", color: COLORS.accentLight }}>{t.arabic}</span>}
+                    {t.arabic && <span style={{ color: COLORS.muted, fontSize: "0.8rem" }}>·</span>}
+                    <span style={{ fontFamily: monoFont, fontSize: "0.83rem", color: COLORS.accent }}>{t.transliteration}</span>
+                    <span style={{ color: COLORS.muted, fontSize: "0.83rem" }}>—</span>
+                    <span style={{ fontFamily: sansFont, fontSize: "0.83rem", color: COLORS.muted }}>{t.meaning}</span>
                   </div>
                 ))}
               </div>
-            )}
+            </div>
+          )}
 
-            {result.transliteration && (
-              <p style={{ fontFamily: monoFont, fontSize: "0.9rem", color: COLORS.muted, margin: "0 0 0.75rem", borderTop: `1px solid ${COLORS.border}`, paddingTop: "0.75rem" }}>
-                🔊 {result.transliteration}
-              </p>
-            )}
+          {/* ── I'RAB HIGHLIGHTS ── */}
+          {mode === "ar-en" && result.irab && result.irab.length > 0 && (
+            <div style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, borderTop: `1px solid ${COLORS.border}`, padding: "1rem 1.25rem", borderBottom: "none" }}>
+              <SectionLabel color="#c896d8">I'rab Highlights</SectionLabel>
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                {result.irab.map((r, i) => (
+                  <div key={i} style={{ fontFamily: sansFont, fontSize: "0.85rem", color: COLORS.text, lineHeight: 1.6 }}>
+                    <span style={{ fontFamily: "'Noto Naskh Arabic', serif", fontSize: "1rem", color: COLORS.accentLight }}>{r.word}</span>
+                    <span style={{ color: COLORS.muted }}> — {r.role}{r.state ? `, therefore ${r.state}` : ""}. </span>
+                    {r.explanation && <span style={{ color: COLORS.muted, fontSize: "0.82rem" }}>{r.explanation}</span>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
-            {/* Translator's note — now only shows when it has real info */}
-            {result.notes && result.notes.trim() && (
-              <div style={{ padding: "0.75rem 1rem", background: COLORS.accent + "11", borderRadius: "8px", borderLeft: `3px solid ${COLORS.accent}` }}>
-                <span style={{ fontFamily: sansFont, fontSize: "0.78rem", color: COLORS.accent, textTransform: "uppercase", letterSpacing: "0.05em" }}>Source</span>
-                <p style={{ fontFamily: sansFont, fontSize: "0.875rem", color: COLORS.text, margin: "0.4rem 0 0", lineHeight: 1.6 }}>{result.notes}</p>
+          {/* ── STUDY TIP + SOURCE ── */}
+          <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.border}`, borderTop: `1px solid ${COLORS.accent}22`, borderRadius: "0 0 12px 12px", padding: "1rem 1.25rem" }}>
+            {result.studyTip && (
+              <div style={{ marginBottom: result.source ? "0.75rem" : 0 }}>
+                <SectionLabel color={COLORS.accent}>Study Tip</SectionLabel>
+                <p style={{ fontFamily: sansFont, fontSize: "0.875rem", color: COLORS.text, margin: 0, lineHeight: 1.6 }}>💡 {result.studyTip}</p>
               </div>
             )}
+            {result.source && (
+              <div>
+                <SectionLabel>Source</SectionLabel>
+                <p style={{ fontFamily: monoFont, fontSize: "0.82rem", color: COLORS.muted, margin: 0 }}>{result.source}</p>
+              </div>
+            )}
+            {/* Actions */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "1rem", paddingTop: "0.75rem", borderTop: `1px solid ${COLORS.border}` }}>
+              <button
+                onClick={() => onSendToNotes(result.translation || "", bookName)}
+                style={{ fontFamily: sansFont, fontSize: "0.85rem", color: COLORS.green, background: COLORS.green + "11", border: `1px solid ${COLORS.green}44`, borderRadius: "8px", padding: "0.4rem 0.9rem", cursor: "pointer" }}
+              >
+                📝 Send to Research Notes
+              </button>
+              <button
+                onClick={() => {
+                  const txt = result.wordByWord
+                    ? result.wordByWord.map(w => `${w.arabic} — ${w.english}`).join("\n") + "\n\n" + result.translation
+                    : result.translation;
+                  navigator.clipboard.writeText(txt);
+                }}
+                style={{ fontFamily: sansFont, fontSize: "0.8rem", color: COLORS.muted, background: "none", border: "none", cursor: "pointer" }}
+              >
+                📋 Copy
+              </button>
+            </div>
           </div>
-          <div style={{ padding: "0.75rem 1.25rem", borderTop: `1px solid ${COLORS.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <button
-              onClick={() => {
-                const text = result.lines
-                  ? result.lines.map(l => l.english).join(" ")
-                  : result.translation;
-                onSendToNotes(text, bookName);
-              }}
-              style={{ fontFamily: sansFont, fontSize: "0.85rem", color: COLORS.green, background: COLORS.green + "11", border: `1px solid ${COLORS.green}44`, borderRadius: "8px", padding: "0.4rem 0.9rem", cursor: "pointer" }}
-            >
-              📝 Send to Research Notes
-            </button>
-            <button
-              onClick={() => {
-                const text = result.lines
-                  ? result.lines.map(l => `${l.arabic}\n${l.english}`).join("\n\n")
-                  : result.translation;
-                navigator.clipboard.writeText(text);
-              }}
-              style={{ fontFamily: sansFont, fontSize: "0.8rem", color: COLORS.muted, background: "none", border: "none", cursor: "pointer" }}
-            >
-              📋 Copy
-            </button>
-          </div>
+
         </div>
       )}
     </div>
