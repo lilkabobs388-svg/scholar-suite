@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import * as pdfjsLib from "pdfjs-dist";
+import pdfjsWorker from "pdfjs-dist/build/pdf.worker.mjs?url";
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
 
 const TABS = ["Research", "Study Planner", "Translator"];
 
@@ -311,13 +312,13 @@ IF no notes provided but book/chapter given:
       if (line.startsWith("## "))
         return (
           <h3 key={i} style={{ color: COLORS.accent, fontFamily: systemFont, fontSize: "1.2rem", margin: "1.2rem 0 0.4rem", borderBottom: `1px solid ${COLORS.border}`, paddingBottom: "0.3rem" }}>
-            {line.slice(3)}
+            {formatBold(line.slice(3))}
           </h3>
         );
       if (line.startsWith("# "))
         return (
           <h2 key={i} style={{ color: COLORS.accentLight, fontFamily: systemFont, fontSize: "1.4rem", margin: "1rem 0 0.5rem" }}>
-            {line.slice(2)}
+            {formatBold(line.slice(2))}
           </h2>
         );
       if (line.startsWith("- "))
