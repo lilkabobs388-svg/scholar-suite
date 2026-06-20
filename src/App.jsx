@@ -100,27 +100,30 @@ async function extractPdfText(file, onProgress) {
   return fullText.trim();
 }
 
-// Simple keyword-based search to find the most relevant chunk of a book for a given
-// topic, so we only send a small, targeted excerpt to the AI instead of the whole text.
-function findRelevantExcerpt(fullText, topic, windowChars = EXCERPT_WINDOW_CHARS) {
-  const keywords = topic
+function localKeywordsFromTopic(topic) {
+  return topic
     .toLowerCase()
     .replace(/[^\p{L}\s]/gu, " ")
     .split(/\s+/)
     .filter((w) => w.length > 2);
+}
 
-  if (keywords.length === 0 || !fullText) return null;
+function scoreAndFindExcerpt(fullText, keywords, windowChars) {
+  if (!keywords || keywords.length === 0 || !fullText) return null;
 
   const scanChunk = 1500;
   const step = 750;
   let bestScore = 0;
   let bestStart = -1;
+  const lowerFull = fullText.toLowerCase();
 
   for (let start = 0; start < fullText.length; start += step) {
-    const chunk = fullText.slice(start, start + scanChunk).toLowerCase();
+    const chunk = lowerFull.slice(start, start + scanChunk);
     let score = 0;
     for (const kw of keywords) {
-      score += chunk.split(kw).length - 1;
+      const k = kw.toLowerCase().trim();
+      if (!k) continue;
+      score += chunk.split(k).length - 1;
     }
     if (score > bestScore) {
       bestScore = score;
@@ -128,11 +131,46 @@ function findRelevantExcerpt(fullText, topic, windowChars = EXCERPT_WINDOW_CHARS
     }
   }
 
-  if (bestStart === -1) return null; // no real match anywhere in the book
+  if (bestStart === -1) return null;
 
   const excerptStart = Math.max(0, bestStart - 500);
   const excerptEnd = Math.min(fullText.length, excerptStart + windowChars);
   return fullText.slice(excerptStart, excerptEnd);
+}
+
+// A plain-text search for an English/transliterated topic will never match Arabic
+// script. When the book is in Arabic, we ask the AI for likely Arabic keywords first
+// (a tiny, cheap call) so the local search actually has something it can match against.
+async function getArabicKeywords(topic) {
+  try {
+    const system = `Given a study topic (in English or transliteration), respond with ONLY 3-6 short Arabic words/phrases (in Arabic script) likely to appear in a classical Arabic text discussing this exact topic. Comma-separated. No English, no explanation, nothing else.`;
+    const text = await callClaude([{ role: "user", content: topic }], system, 80);
+    return text.split(",").map((s) => s.trim()).filter(Boolean);
+  } catch (e) {
+    return [];
+  }
+}
+
+// Simple keyword-based search to find the most relevant chunk of a book for a given
+// topic, so we only send a small, targeted excerpt to the AI instead of the whole text.
+async function findRelevantExcerpt(fullText, topic, windowChars = EXCERPT_WINDOW_CHARS) {
+  if (!fullText) return null;
+
+  // First try direct keywords from the topic as typed (covers Latin/transliterated books)
+  const englishKeywords = localKeywordsFromTopic(topic);
+  let excerpt = scoreAndFindExcerpt(fullText, englishKeywords, windowChars);
+  if (excerpt) return excerpt;
+
+  // If the book is in Arabic script, an English topic will never match — get Arabic
+  // keyword equivalents first, then search again
+  const looksArabic = /[\u0600-\u06FF]/.test(fullText.slice(0, 3000));
+  if (looksArabic) {
+    const arabicKeywords = await getArabicKeywords(topic);
+    excerpt = scoreAndFindExcerpt(fullText, arabicKeywords, windowChars);
+    if (excerpt) return excerpt;
+  }
+
+  return null; // no real match anywhere in the book
 }
 
 function BookLibraryPanel({ library, addBook, removeBook, selectedBookId, onSelectBook }) {
@@ -243,10 +281,10 @@ function ResearchAssistant({ prefillNotes, prefillTopic, prefillBook }) {
       let excerptNotFound = false;
 
       if (!notes.trim() && selectedBook) {
-        const excerpt = findRelevantExcerpt(selectedBook.text, topic);
+        const excerpt = await findRelevantExcerpt(selectedBook.text, topic);
         if (excerpt) {
-          bookContext = `Below is an EXCERPT found by searching the actual book "${selectedBook.name}" for content matching the topic. It may not be the full chapter and may include text just before or after the most relevant part — use your judgement to focus on what's actually relevant. Base your notes on this real text, not general outside knowledge.`;
-          bookTextBlock = `\n\n--- EXCERPT FROM "${selectedBook.name}" ---\n${excerpt}\n--- END EXCERPT ---`;
+          bookContext = `Below is an EXCERPT found by searching the actual book "${selectedBook.name}" for content matching the topic. It is in Arabic. Read it directly and base your notes ONLY on what this specific excerpt actually says — translate and structure its real content. Do NOT substitute a different classification or definition you happen to know generally, even if it's a well-known one, if it doesn't match what's actually written in this excerpt. If the excerpt lists a specific number of types/categories, use exactly that number and those names — don't replace them with a more "famous" version from elsewhere.`;
+          bookTextBlock = `\n\n--- EXCERPT FROM "${selectedBook.name}" (Arabic) ---\n${excerpt}\n--- END EXCERPT ---`;
         } else {
           excerptNotFound = true;
           bookContext = `The user has the book "${selectedBook.name}" but a text search for this topic inside it found no clear match — it may be phrased differently in the book, or this topic may be in a different part. Use your own knowledge of this book and topic instead, and don't pretend to quote the book directly.`;
