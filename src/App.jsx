@@ -27,7 +27,8 @@ const sansFont = "'DM Sans', sans-serif";
 const LIBRARY_KEY = "scholarSuiteLibrary";
 // Groq's free tier caps around 6,000-12,000 tokens/minute (input+output combined) for this
 // model — far less than its 128k context window. We keep excerpts small and surface 429s clearly.
-const EXCERPT_WINDOW_CHARS = 4000;
+const EXCERPT_WINDOW_CHARS = 4000; // Arabic — denser tokenization, kept conservative
+const LATIN_EXCERPT_WINDOW_CHARS = 9000; // English/transliterated — cheaper per character
 
 async function callClaude(messages, systemPrompt, maxTokens = 1200) {
   const body = {
@@ -93,7 +94,28 @@ async function extractPdfText(file, onProgress) {
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
-    const pageText = content.items.map((item) => item.str).join(" ");
+    let pageText = "";
+    let lastY = null;
+
+    for (const item of content.items) {
+      const y = item.transform[5];
+      const fontHeight = Math.abs(item.transform[3]) || 10;
+
+      if (lastY !== null) {
+        const dy = Math.abs(lastY - y);
+        if (dy > fontHeight * 1.4) {
+          pageText += "\n\n"; // big vertical jump — heading or paragraph break
+        } else if (dy > fontHeight * 0.4) {
+          pageText += "\n"; // normal new line
+        } else {
+          pageText += item.str.startsWith(" ") || pageText.endsWith(" ") ? "" : " ";
+        }
+      }
+
+      pageText += item.str;
+      lastY = y;
+    }
+
     fullText += pageText + "\n\n";
     if (onProgress) onProgress(i, pdf.numPages);
   }
@@ -106,6 +128,42 @@ function localKeywordsFromTopic(topic) {
     .replace(/[^\p{L}\s]/gu, " ")
     .split(/\s+/)
     .filter((w) => w.length > 2);
+}
+
+// Walk backward from a keyword-match point to the nearest paragraph/section break
+// (blank line), so the excerpt starts at the beginning of that section rather than
+// mid-way through it — important for stories/narratives that need to be read from
+// the start, not just wherever the keyword happens to cluster most densely.
+function backUpToSectionStart(text, approxIndex, maxBack = 6000) {
+  const searchFrom = Math.max(0, approxIndex - maxBack);
+  const slice = text.slice(searchFrom, approxIndex);
+
+  // Split into paragraph-like blocks on blank-line breaks
+  const paraBreak = /\n\s*\n/g;
+  let lastEnd = 0;
+  const blocks = [];
+  let m;
+  while ((m = paraBreak.exec(slice)) !== null) {
+    blocks.push({ start: lastEnd, end: m.index });
+    lastEnd = m.index + m[0].length;
+  }
+  blocks.push({ start: lastEnd, end: slice.length });
+
+  // Walk backward looking for a short, standalone block — likely a chapter/story title
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const block = slice.slice(blocks[i].start, blocks[i].end).trim();
+    if (block.length > 0 && block.length < 60 && !block.includes("\n")) {
+      return searchFrom + blocks[i].start;
+    }
+  }
+
+  // No heading-like block found — fall back to the nearest blank-line break
+  const breaks = [...slice.matchAll(/\n\s*\n/g)];
+  if (breaks.length > 0) {
+    const last = breaks[breaks.length - 1];
+    return searchFrom + last.index + last[0].length;
+  }
+  return Math.max(0, approxIndex - 500);
 }
 
 function scoreAndFindExcerpt(fullText, keywords, windowChars) {
@@ -133,19 +191,103 @@ function scoreAndFindExcerpt(fullText, keywords, windowChars) {
 
   if (bestStart === -1) return null;
 
-  const excerptStart = Math.max(0, bestStart - 500);
+  const excerptStart = backUpToSectionStart(fullText, bestStart);
   const excerptEnd = Math.min(fullText.length, excerptStart + windowChars);
   return fullText.slice(excerptStart, excerptEnd);
 }
 
-// A plain-text search for an English/transliterated topic will never match Arabic
-// script. When the book is in Arabic, we ask the AI for likely Arabic keywords first
-// (a tiny, cheap call) so the local search actually has something it can match against.
-async function getArabicKeywords(topic) {
+// Classical Arabic PDFs mix diacritics (tashkeel) inconsistently and use different
+// shapes for the same letter (إ أ آ ا are all "alef"). A literal search fails on tiny
+// mismatches like this. We strip diacritics and unify letter variants before matching,
+// while keeping a map back to the original character positions so the excerpt we
+// return is the real, untouched text.
+function normalizeArabicChar(ch) {
+  if (/[\u064B-\u0652\u0670\u0640]/.test(ch)) return ""; // diacritics + tatweel — dropped
+  if (/[إأآا]/.test(ch)) return "ا";
+  if (ch === "ى") return "ي";
+  if (ch === "ة") return "ه";
+  return ch;
+}
+
+function normalizeArabicWithMap(text) {
+  let normalized = "";
+  const map = []; // map[i] = index in the original text that normalized[i] came from
+  for (let i = 0; i < text.length; i++) {
+    const nch = normalizeArabicChar(text[i]);
+    if (nch === "") continue;
+    normalized += nch;
+    map.push(i);
+  }
+  return { normalized, map };
+}
+
+function normalizeArabicPlain(text) {
+  let out = "";
+  for (const ch of text) {
+    out += normalizeArabicChar(ch);
+  }
+  return out;
+}
+
+function scoreAndFindExcerptArabic(fullText, keywords, windowChars) {
+  if (!keywords || keywords.length === 0 || !fullText) return null;
+
+  const { normalized, map } = normalizeArabicWithMap(fullText);
+
+  // Expand each AI-given phrase into both the full phrase and its individual words —
+  // PDF text extraction can introduce odd spacing, so matching single strong words too
+  // makes this much more forgiving than requiring exact multi-word adjacency.
+  const expanded = new Set();
+  for (const kw of keywords) {
+    const norm = normalizeArabicPlain(kw.trim());
+    if (norm.length >= 2) expanded.add(norm);
+    for (const word of norm.split(/\s+/)) {
+      if (word.length >= 2) expanded.add(word);
+    }
+  }
+  const kwList = Array.from(expanded);
+  if (kwList.length === 0) return null;
+
+  const scanChunk = 1800;
+  const step = 900;
+  let bestScore = 0;
+  let bestStart = -1;
+
+  for (let start = 0; start < normalized.length; start += step) {
+    const chunk = normalized.slice(start, start + scanChunk);
+    let score = 0;
+    for (const kw of kwList) {
+      score += chunk.split(kw).length - 1;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestStart = start;
+    }
+  }
+
+  if (bestStart === -1) return null;
+
+  const originalStart = map[bestStart] ?? 0;
+  const excerptStart = backUpToSectionStart(fullText, originalStart);
+  const excerptEnd = Math.min(fullText.length, excerptStart + windowChars);
+  return fullText.slice(excerptStart, excerptEnd);
+}
+
+// A plain literal search fails whenever the topic's wording doesn't exactly match the
+// book's own wording — different spelling of a name (Nuh/Nooh/Noah), different phrasing
+// ("story of X" vs. the book's actual heading), or Arabic script entirely. In all these
+// cases we ask the AI for likely alternate keywords/spellings first (a tiny, cheap call)
+// so the local search has real candidates to match against.
+async function getAlternateKeywords(topic, isArabicScript) {
   try {
-    const system = `Given a study topic (in English or transliteration), respond with ONLY 3-6 short Arabic words/phrases (in Arabic script) likely to appear in a classical Arabic text discussing this exact topic. Comma-separated. No English, no explanation, nothing else.`;
+    const system = isArabicScript
+      ? `Given a study topic (in English or transliteration), respond with ONLY 3-6 short Arabic words/phrases (in Arabic script) likely to appear in a classical Arabic text discussing this exact topic. Comma-separated. No English, no explanation, nothing else.`
+      : `Given a study/research topic, respond with ONLY 3-6 short alternate keywords or phrasings likely to appear as a heading or in the body text of a book discussing this exact topic — including likely alternate spellings of any names involved (e.g. Nuh/Nooh/Noah, Yusuf/Yousuf/Joseph). Comma-separated. No explanation, nothing else.`;
     const text = await callClaude([{ role: "user", content: topic }], system, 80);
-    return text.split(",").map((s) => s.trim()).filter(Boolean);
+    return text
+      .split(",")
+      .map((s) => s.trim().replace(/^["'\u201c\u201d]+|["'\u201c\u201d]+$/g, ""))
+      .filter(Boolean);
   } catch (e) {
     return [];
   }
@@ -153,24 +295,58 @@ async function getArabicKeywords(topic) {
 
 // Simple keyword-based search to find the most relevant chunk of a book for a given
 // topic, so we only send a small, targeted excerpt to the AI instead of the whole text.
-async function findRelevantExcerpt(fullText, topic, windowChars = EXCERPT_WINDOW_CHARS) {
+// Latin-script text tokenizes far more efficiently than Arabic, so we can afford a much
+// bigger window for English/transliterated books within the same rate-limit budget.
+async function findRelevantExcerpt(fullText, topic) {
   if (!fullText) return null;
 
-  // First try direct keywords from the topic as typed (covers Latin/transliterated books)
+  const looksArabic = /[\u0600-\u06FF]/.test(fullText.slice(0, 3000));
+  const windowChars = looksArabic ? EXCERPT_WINDOW_CHARS : LATIN_EXCERPT_WINDOW_CHARS;
+
+  if (looksArabic) {
+    let excerpt = scoreAndFindExcerptArabic(fullText, localKeywordsFromTopic(topic), windowChars);
+    if (excerpt) return excerpt;
+    const arabicKeywords = await getAlternateKeywords(topic, true);
+    excerpt = scoreAndFindExcerptArabic(fullText, arabicKeywords, windowChars);
+    return excerpt;
+  }
+
   const englishKeywords = localKeywordsFromTopic(topic);
   let excerpt = scoreAndFindExcerpt(fullText, englishKeywords, windowChars);
   if (excerpt) return excerpt;
 
-  // If the book is in Arabic script, an English topic will never match — get Arabic
-  // keyword equivalents first, then search again
-  const looksArabic = /[\u0600-\u06FF]/.test(fullText.slice(0, 3000));
+  const altKeywords = await getAlternateKeywords(topic, false);
+  excerpt = scoreAndFindExcerpt(fullText, [...englishKeywords, ...altKeywords], windowChars);
+  return excerpt; // may be null — caller handles that honestly
+}
+
+// Finds where a pasted passage actually occurs in a selected book and returns the
+// surrounding text — used by the Translator so the AI can see the real sentences
+// around what's being translated (helps with pronouns, references, exact wording).
+function findSurroundingContext(bookText, snippet, contextChars = 800) {
+  if (!bookText || !snippet) return null;
+  const looksArabic = /[\u0600-\u06FF]/.test(snippet);
+
   if (looksArabic) {
-    const arabicKeywords = await getArabicKeywords(topic);
-    excerpt = scoreAndFindExcerpt(fullText, arabicKeywords, windowChars);
-    if (excerpt) return excerpt;
+    const { normalized, map } = normalizeArabicWithMap(bookText);
+    const normSnippet = normalizeArabicPlain(snippet.trim()).slice(0, 60);
+    if (normSnippet.length < 10) return null;
+    const idx = normalized.indexOf(normSnippet);
+    if (idx === -1) return null;
+    const originalIdx = map[idx] ?? 0;
+    const start = Math.max(0, originalIdx - contextChars);
+    const end = Math.min(bookText.length, originalIdx + normSnippet.length + contextChars);
+    return bookText.slice(start, end);
   }
 
-  return null; // no real match anywhere in the book
+  const lower = bookText.toLowerCase();
+  const snippetLower = snippet.trim().toLowerCase().slice(0, 60);
+  if (snippetLower.length < 10) return null;
+  const idx = lower.indexOf(snippetLower);
+  if (idx === -1) return null;
+  const start = Math.max(0, idx - contextChars);
+  const end = Math.min(bookText.length, idx + snippetLower.length + contextChars);
+  return bookText.slice(start, end);
 }
 
 function BookLibraryPanel({ library, addBook, removeBook, selectedBookId, onSelectBook }) {
@@ -281,10 +457,11 @@ function ResearchAssistant({ prefillNotes, prefillTopic, prefillBook }) {
       let excerptNotFound = false;
 
       if (!notes.trim() && selectedBook) {
+        const isArabicBook = /[\u0600-\u06FF]/.test(selectedBook.text.slice(0, 3000));
         const excerpt = await findRelevantExcerpt(selectedBook.text, topic);
         if (excerpt) {
-          bookContext = `Below is an EXCERPT found by searching the actual book "${selectedBook.name}" for content matching the topic. It is in Arabic. Read it directly and base your notes ONLY on what this specific excerpt actually says — translate and structure its real content. Do NOT substitute a different classification or definition you happen to know generally, even if it's a well-known one, if it doesn't match what's actually written in this excerpt. If the excerpt lists a specific number of types/categories, use exactly that number and those names — don't replace them with a more "famous" version from elsewhere.`;
-          bookTextBlock = `\n\n--- EXCERPT FROM "${selectedBook.name}" (Arabic) ---\n${excerpt}\n--- END EXCERPT ---`;
+          bookContext = `Below is an EXCERPT found by searching the actual book "${selectedBook.name}" for content matching the topic.${isArabicBook ? " It is in Arabic." : ""} Read it directly and base your notes ONLY on what this specific excerpt actually says — translate and structure its real content. Do NOT substitute a different classification, definition, or version of events you happen to know generally, even if it's a well-known one, if it doesn't match what's actually written in this excerpt. If the excerpt lists a specific number of types/categories, use exactly that number and those names. If the excerpt is a narrative/story, it may be cut off at the start or end of the window — cover everything that IS included, in the order it happens, without skipping ahead to a part later in the excerpt and ignoring the earlier part.`;
+          bookTextBlock = `\n\n--- EXCERPT FROM "${selectedBook.name}"${isArabicBook ? " (Arabic)" : ""} ---\n${excerpt}\n--- END EXCERPT ---`;
         } else {
           excerptNotFound = true;
           bookContext = `The user has the book "${selectedBook.name}" but a text search for this topic inside it found no clear match — it may be phrased differently in the book, or this topic may be in a different part. Use your own knowledge of this book and topic instead, and don't pretend to quote the book directly.`;
@@ -297,14 +474,20 @@ function ResearchAssistant({ prefillNotes, prefillTopic, prefillBook }) {
 
 ${bookContext}
 
-Format: ## headers, numbered lists for types/categories, - bullet points for sub-points, **bold** for term names.
+CONTENT TYPE — pick the right structure for what's actually there:
 
-RULES for headers:
-- Name headers after the actual concepts (e.g. "Fasahat of Kalimah", "3 Types of Fasahat", "Linguistic Definition")
-- Never use generic headers like "Introduction to X", "What is X?", "Key Points", "Key Concepts"
+If the source is a NARRATIVE/STORY (history, seerah, Qisas al-Anbiya, Quranic stories, biography):
+- Retell it as a clear chronological sequence — what happened first, then next, then after that, in the order it actually occurs
+- Use headers to mark major STAGES of the story (e.g. "The Persecution Begins", "Allah Commands the Ark", "The Flood"), not abstract themes pulled from random points
+- Cover the full sequence of events that's actually in front of you — don't jump to a later part and present only that as if it were the whole story
+- Bullet points are for breaking up long paragraphs into readable beats, not for chopping the story into disconnected trivia
+
+If the source is DEFINITIONAL/CLASSIFICATORY (fiqh, usul, nahw, sarf, balaghah):
+- Use ## headers, numbered lists for types/categories, - bullets for sub-points, **bold** for term names
+- Name headers after the actual concepts (e.g. "Fasahat of Kalimah", "3 Types of Fasahat", "Linguistic Definition") — never generic ones like "Introduction to X" or "Key Points"
 - Mirror the structure of the actual chapter — if it has types, list types; if it has definitions, start with definitions
+- Follow this example:
 
-RULES for notes style (follow this example):
 ## Fasahat — Linguistic Definition
 - In the dictionary: what informs regarding clarity and apparent-ness (al-bayan wal-dhuhur)
 - It is said: "The boy is most eloquent in his speech" — when his words become clear and apparent
@@ -318,18 +501,18 @@ RULES for notes style (follow this example):
 IF the user provides notes/a passage:
 - Extract and structure the actual content — don't summarise loosely
 - Keep all technical terms as-is
-- Use numbered lists for types/categories exactly as they appear in the text
+- Cover everything in it from start to finish
 
 IF no notes provided but book/chapter given:
 - Use your real knowledge of that specific chapter
-- Give the actual definitions, types, conditions and examples from that source
+- Give the actual definitions, types, conditions, events and examples from that source
 - Do NOT give generic Islamic advice or relate it to Quran/hadith unless the chapter does so`;
 
       const userMsg = notes.trim()
-        ? `Topic: ${topic}${bookName.trim() ? `\nSource: ${bookName.trim()}` : ""}\n\nText to make notes from:\n${notes}\n\nMake clear, focused notes based on this specific text.`
-        : `Topic: ${topic}${bookName.trim() ? `\nBook/Source: ${bookName.trim()}` : ""}\n\nGive me real, accurate notes on this specific topic from this specific source.${bookTextBlock}`;
+        ? `Topic: ${topic}${bookName.trim() ? `\nSource: ${bookName.trim()}` : ""}\n\nText to make notes from:\n${notes}\n\nMake clear, focused notes based on this specific text, covering it completely from start to finish.`
+        : `Topic: ${topic}${bookName.trim() ? `\nBook/Source: ${bookName.trim()}` : ""}\n\nGive me real, accurate notes on this specific topic from this specific source, covering it completely.${bookTextBlock}`;
 
-      const text = await callClaude([{ role: "user", content: userMsg }], system, 1500);
+      const text = await callClaude([{ role: "user", content: userMsg }], system, 2000);
       setResult(excerptNotFound ? `⚠️ No exact match found in your PDF for this topic — using general knowledge instead.\n\n${text}` : text);
       setHistory((h) => [{ topic, bookName, result: text }, ...h.slice(0, 4)]);
     } catch (e) {
@@ -633,15 +816,33 @@ function ArabicTranslator({ onSendToNotes }) {
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [mode, setMode] = useState("ar-en");
+  const { library, addBook, removeBook } = useBookLibrary();
+  const [selectedBookId, setSelectedBookId] = useState(null);
+
+  const selectedBook = library.find((b) => b.id === selectedBookId) || null;
+
+  function handleSelectBook(id) {
+    setSelectedBookId(id);
+    const book = library.find((b) => b.id === id);
+    setBookName(book ? book.name : "");
+  }
 
   async function translate() {
     if (!input.trim()) return;
     setLoading(true);
     setResult(null);
     try {
-      const bookContext = bookName.trim()
-        ? `This text is from: "${bookName.trim()}". Use your knowledge of this source to inform the translation, subject detection, and source notes.`
-        : "";
+      let bookContext = "";
+      if (selectedBook) {
+        const context = findSurroundingContext(selectedBook.text, input);
+        if (context) {
+          bookContext = `This passage is from the book "${selectedBook.name}". Below is the REAL surrounding text from the actual book, for context only — use it to correctly understand pronouns, references, and exact intended meaning, but translate only the passage the user actually pasted, not this whole context block:\n\n--- SURROUNDING CONTEXT FROM "${selectedBook.name}" ---\n${context}\n--- END CONTEXT ---`;
+        } else {
+          bookContext = `This text is from: "${selectedBook.name}". Use your knowledge of this source to inform the translation, subject detection, and source notes.`;
+        }
+      } else if (bookName.trim()) {
+        bookContext = `This text is from: "${bookName.trim()}". Use your knowledge of this source to inform the translation, subject detection, and source notes.`;
+      }
 
       const system = mode === "ar-en"
         ? `You are an expert translator of Classical Arabic texts and a study assistant for students of traditional Islamic sciences.
@@ -696,7 +897,7 @@ Respond ONLY with valid JSON in this exact format — no extra text, no markdown
   );
 
   return (
-    <div style={{ maxWidth: "780px", margin: "0 auto" }}>
+    <div style={{ maxWidth: "780px", margin: "0 auto", height: "100%", overflowY: "auto", paddingBottom: "2rem", boxSizing: "border-box" }}>
       {/* Mode toggle */}
       <div style={{ display: "flex", gap: "0.75rem", marginBottom: "1.25rem", justifyContent: "center" }}>
         {[["ar-en", "العربية → English"], ["en-ar", "English → العربية"]].map(([v, label]) => (
@@ -710,14 +911,30 @@ Respond ONLY with valid JSON in this exact format — no extra text, no markdown
         ))}
       </div>
 
+      {/* Book library */}
+      <div style={{ marginBottom: "0.75rem" }}>
+        <BookLibraryPanel
+          library={library}
+          addBook={addBook}
+          removeBook={removeBook}
+          selectedBookId={selectedBookId}
+          onSelectBook={handleSelectBook}
+        />
+      </div>
+
       {/* Book name */}
       <div style={{ marginBottom: "0.75rem" }}>
         <input
           value={bookName}
-          onChange={(e) => setBookName(e.target.value)}
-          placeholder="Book name (optional) — e.g. Hidaya, Duroos al-Balaghah, Usool e Shashi..."
+          onChange={(e) => { setBookName(e.target.value); setSelectedBookId(null); }}
+          placeholder="Type a name, or select a book above"
           style={{ ...inputStyle, fontSize: "0.875rem" }}
         />
+        {selectedBook && (
+          <div style={{ fontFamily: sansFont, fontSize: "0.75rem", color: COLORS.green, marginTop: "0.3rem" }}>
+            ✓ Reading from your uploaded PDF ({selectedBook.chars.toLocaleString()} chars)
+          </div>
+        )}
       </div>
 
       {/* Input area */}
